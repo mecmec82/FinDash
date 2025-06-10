@@ -205,7 +205,7 @@ if tickers_to_fetch:
             "Trailing P/E",
         ]
         # Filter for columns that actually exist in the fetched data
-        existing_cols = [col for col col in df.columns if col in desired_order] # Preserve order
+        existing_cols = [col for col in df.columns if col in desired_order]
         df = df[existing_cols] # Apply desired_order for existing columns
 
         st.subheader("Comparison Table")

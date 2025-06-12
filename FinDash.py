@@ -1,253 +1,172 @@
-import streamlit as st
-import pandas as pd
 import yfinance as yf
-import numpy as np
-import re
+import sys
+import time # Import time for adding delays
 
-# --- Helper Functions for Data Fetching and Calculation ---
+def calculate_peg_ratio(price, eps, growth_rate):
+    """
+    Calculates the PEG (Price/Earnings to Growth) ratio.
 
-@st.cache_data(ttl=3600) # Cache data for 1 hour to reduce API calls
-def fetch_company_data(ticker_symbol):
+    Args:
+        price (float): The current stock price.
+        eps (float): The Earnings Per Share (usually trailing 12 months or forward).
+        growth_rate (float): The annual EPS growth rate as a percentage (e.g., 15 for 15%).
+                             Note: This function expects it as a whole number, not a decimal.
+
+    Returns:
+        float: The calculated PEG ratio, or None if calculation is not possible.
     """
-    Fetches and calculates financial data for a given ticker using yfinance.
-    """
-    data = {
-        "Company": f"{ticker_symbol.upper()}", # Default, will be updated with longName
-        "Industry": "N/A",
-        "Market Cap (B)": np.nan,
-        "1Yr Sales Growth": np.nan,
-        "5Yr Sales Growth": np.nan,
-        "Debt to Equity": np.nan,
-        "PEG Ratio": np.nan, # Cannot be reliably calculated with yfinance for forward growth
-        "Trailing P/E": np.nan, # Included as a substitute valuation metric
-    }
+    if price <= 0:
+        return None
+    if eps <= 0:
+        return None
+    if growth_rate <= 0:
+        return None
 
     try:
-        stock = yf.Ticker(ticker_symbol)
-        info = stock.info
-        
-        # Check if the ticker is valid and info is available
-        # Some invalid tickers might still return a Ticker object but with no info
-        if not info or not info.get('longName') or 'regularMarketPrice' not in info:
-            st.warning(f"Could not find valid data for ticker: {ticker_symbol.upper()}. It might be an invalid symbol or have no available data.")
-            return None # Return None if ticker is invalid
-
-        financials = stock.financials # Annual income statement
-        balance_sheet = stock.balance_sheet # Annual balance sheet
-
-        # Basic Info
-        data["Company"] = info.get("longName", f"{ticker_symbol.upper()}")
-        data["Industry"] = info.get("industry", "N/A")
-        if info.get("marketCap"):
-            data["Market Cap (B)"] = info["marketCap"] / 1_000_000_000 # Convert to billions
-
-        # Trailing P/E
-        if info.get("trailingPE"):
-            data["Trailing P/E"] = info["trailingPE"]
-
-        # Sales Growth Calculations
-        if 'Total Revenue' in financials.index:
-            revenues = financials.loc['Total Revenue']
-            
-            # 1-Year Sales Growth
-            if len(revenues) >= 2 and revenues.iloc[1] != 0:
-                data["1Yr Sales Growth"] = (revenues.iloc[0] - revenues.iloc[1]) / revenues.iloc[1]
-            else:
-                st.info(f"Not enough annual revenue data (at least 2 years) for {ticker_symbol} to calculate 1-Year Sales Growth.")
-            
-            # 5-Year Sales Growth (Compound Annual Growth Rate - CAGR)
-            # Need at least 5 years of data for 5-year growth (index 0 to 4 inclusive)
-            if len(revenues) >= 5:
-                # Revenues are ordered descending by year, so iloc[0] is latest, iloc[4] is 5 years prior
-                latest_revenue = revenues.iloc[0]
-                revenue_5_years_ago = revenues.iloc[4]
-                
-                if revenue_5_years_ago > 0: # Ensure no division by zero or negative base for CAGR
-                    data["5Yr Sales Growth"] = (latest_revenue / revenue_5_years_ago)**(1/5) - 1
-                elif latest_revenue > 0 and revenue_5_years_ago == 0:
-                    data["5Yr Sales Growth"] = float('inf') # Infinite growth from zero base
-                else:
-                    st.info(f"5-Year ago revenue is zero or negative for {ticker_symbol}, cannot calculate 5-Year Sales Growth meaningfully.")
-            else:
-                st.info(f"Not enough annual revenue data (at least 5 years) for {ticker_symbol} to calculate 5-Year Sales Growth.")
-        else:
-            st.info(f"Total Revenue data not available in annual financials for {ticker_symbol}.")
-
-
-        # Debt to Equity Calculation
-        total_debt = np.nan
-        total_equity = np.nan
-
-        # Attempt to get Total Stockholder Equity
-        if 'Total Stockholder Equity' in balance_sheet.index and not balance_sheet.loc['Total Stockholder Equity'].empty:
-            total_equity = balance_sheet.loc['Total Stockholder Equity'].iloc[0]
-        else:
-            st.info(f"Total Stockholder Equity data not available for {ticker_symbol}.")
-
-        # Calculate Total Debt from Long Term Debt and Short Term Debt
-        long_term_debt = balance_sheet.loc['Long Term Debt'].iloc[0] if 'Long Term Debt' in balance_sheet.index and not balance_sheet.loc['Long Term Debt'].empty else 0
-        short_term_debt = balance_sheet.loc['Current Debt'].iloc[0] if 'Current Debt' in balance_sheet.index and not balance_sheet.loc['Current Debt'].empty else \
-                         (balance_sheet.loc['Short Term Debt'].iloc[0] if 'Short Term Debt' in balance_sheet.index and not balance_sheet.loc['Short Term Debt'].empty else 0)
-
-        # If we successfully got both, sum them up
-        if long_term_debt is not None and short_term_debt is not None:
-             total_debt = long_term_debt + short_term_debt
-        else:
-            st.info(f"Long Term Debt or Short Term Debt data not available for {ticker_symbol}.")
-
-        # Perform Debt to Equity calculation if all components are available
-        if pd.notna(total_debt) and pd.notna(total_equity):
-            if total_equity != 0:
-                data["Debt to Equity"] = total_debt / total_equity
-            else:
-                data["Debt to Equity"] = float('inf') # Infinite D/E if equity is zero
-        else:
-            data["Debt to Equity"] = np.nan # Ensure it's NaN if data is truly missing
-            
+        pe_ratio = price / eps
+        peg_ratio = pe_ratio / growth_rate
+        return peg_ratio
+    except ZeroDivisionError:
+        return None
     except Exception as e:
-        st.error(f"An unexpected error occurred while fetching or processing data for {ticker_symbol.upper()}. Error: {e}")
-        return None # Indicate failure for this ticker
+        return None
 
-    return data
+def get_stock_data(ticker_symbol):
+    """
+    Fetches stock data (price, EPS, growth rate) using yfinance.
+    Includes enhanced debugging output to identify missing data points.
 
-def format_value(value, metric_type):
-    """Formats values for display based on metric type, handling NaNs."""
-    if pd.isna(value):
-        return "N/A"
-    if metric_type == "percent":
-        return f"{value:.2%}"
-    elif metric_type == "currency_billion":
-        return f"${value:,.0f}B"
-    elif metric_type == "ratio":
-        # Handle infinite D/E or growth gracefully
-        if value == float('inf'):
-            return "Inf"
-        return f"{value:.2f}"
-    else: # Default for other numbers
-        return str(value)
+    Args:
+        ticker_symbol (str): The stock ticker symbol (e.g., 'AAPL', 'MSFT').
 
-# --- Streamlit App Layout ---
-
-st.set_page_config(layout="wide", page_title="Dynamic Financial Company Comparator")
-
-st.title("📊 Dynamic Company Financial Comparator")
-
-st.markdown("""
-Enter one or more company stock ticker symbols (e.g., `AAPL, MSFT, AMZN`) in the input box below.
-Separate multiple tickers with commas.
-""")
-
-# Input for ticker symbols
-ticker_input = st.text_input(
-    "Enter Ticker Symbols (e.g., AAPL, MSFT, GOOGL):",
-    value="AAPL, MSFT, AMZN, KO", # Default value for convenience, including KO
-    help="Enter comma-separated stock ticker symbols (e.g., AAPL, MSFT, GOOGL)."
-)
-
-# Process input tickers
-# Clean up input: remove spaces, split by comma, filter empty strings, convert to uppercase
-tickers_to_fetch = [
-    ticker.strip().upper() for ticker in ticker_input.split(',') if ticker.strip()
-]
-
-if tickers_to_fetch:
-    comparison_data_list = []
-    invalid_tickers = []
-    missing_data_messages = st.empty() # Placeholder for info messages
-
-    st.info(f"Attempting to fetch data for: {', '.join(tickers_to_fetch)}")
-
-    with st.spinner("Fetching financial data... This may take a moment per ticker."):
-        # Use a temporary list for messages to display at the end
-        temp_messages = []
-        # Redirect st.info from fetch_company_data to our list
-        # This is a bit advanced, but allows us to capture messages
-        # and display them all at once after the spinner is gone.
-        original_st_info = st.info
-        def capture_info_message(message):
-            temp_messages.append(message)
-        st.info = capture_info_message # Temporarily replace st.info
-
-        for ticker in tickers_to_fetch:
-            company_data = fetch_company_data(ticker)
-            if company_data:
-                comparison_data_list.append(company_data)
-            else:
-                invalid_tickers.append(ticker)
-        
-        st.info = original_st_info # Restore original st.info after fetching
+    Returns:
+        tuple: (company_name, price, eps, growth_rate_percent) or (None, None, None, None) if data is not found/invalid.
+    """
+    ticker = yf.Ticker(ticker_symbol)
     
-    # Display captured messages
-    if temp_messages:
-        with missing_data_messages.container():
-            st.markdown("##### Data Availability Notes:")
-            for msg in temp_messages:
-                st.info(msg)
+    # Add a small delay to avoid potential rate limiting, especially when fetching multiple tickers quickly.
+    time.sleep(0.5) # Wait for 0.5 seconds between requests
 
+    try:
+        info = ticker.info
 
-    if invalid_tickers:
-        st.warning(f"Could not retrieve data for the following tickers: {', '.join(invalid_tickers)}. They might be invalid, or `yfinance` had issues fetching their data.")
+        # --- DEBUGGING START ---
+        # Check if the info dictionary is populated at all
+        if not info or len(info) < 50: # A rough heuristic for sufficient data (info dict usually has many keys)
+            print(f"DEBUG: Info dictionary for '{ticker_symbol}' is empty or incomplete (length: {len(info) if info else 0}). This is a major issue.", file=sys.stderr)
+            return None, None, None, None
 
-    if comparison_data_list:
-        df = pd.DataFrame(comparison_data_list)
+        company_name = info.get('longName', ticker_symbol)
+        
+        price = info.get('currentPrice')
+        if price is None:
+             price = info.get('regularMarketPrice') # Fallback for real-time price
+             if price is None:
+                 print(f"DEBUG: For {ticker_symbol}, 'currentPrice' and 'regularMarketPrice' are both None. Price is missing.", file=sys.stderr)
 
-        # Set 'Company' as the index for better presentation
-        df.set_index("Company", inplace=True)
+        eps = info.get('trailingEps') 
+        if eps is None:
+            eps = info.get('forwardEps') # Try forwardEps as a fallback
+            if eps is None:
+                print(f"DEBUG: For {ticker_symbol}, 'trailingEps' and 'forwardEps' are both None. EPS is missing.", file=sys.stderr)
 
-        # Reorder columns for better readability
-        desired_order = [
-            "Industry",
-            "Market Cap (B)",
-            "1Yr Sales Growth",
-            "5Yr Sales Growth",
-            "Debt to Equity",
-            "PEG Ratio", # Will be N/A
-            "Trailing P/E",
-        ]
-        # Filter for columns that actually exist in the fetched data
-        existing_cols = [col for col in df.columns if col in desired_order]
-        df = df[existing_cols] # Apply desired_order for existing columns
+        growth_rate_decimal = info.get('nextFiveYearsEarningsGrowth') 
+        if growth_rate_decimal is None:
+            print(f"DEBUG: For {ticker_symbol}, 'nextFiveYearsEarningsGrowth' is None. This is often the reason PEG fails.", file=sys.stderr)
 
-        st.subheader("Comparison Table")
+        growth_rate_percent = None
+        if growth_rate_decimal is not None:
+            growth_rate_percent = growth_rate_decimal * 100 # Convert 0.15 to 15
 
-        # Apply conditional formatting using our helper function
-        df_formatted = df.copy()
+        # Final check before returning None for any missing critical piece
+        if price is None:
+            print(f"DEBUG: Final check for {ticker_symbol}: Price is definitively None.", file=sys.stderr)
+            return company_name, None, None, None
+        if eps is None:
+            print(f"DEBUG: Final check for {ticker_symbol}: EPS is definitively None.", file=sys.stderr)
+            return company_name, None, None, None
+        if growth_rate_percent is None:
+            print(f"DEBUG: Final check for {ticker_symbol}: Growth Rate is definitively None.", file=sys.stderr)
+            return company_name, None, None, None # Crucial for PEG calculation
 
-        format_map = {
-            "1Yr Sales Growth": "percent",
-            "5Yr Sales Growth": "percent",
-            "Debt to Equity": "ratio",
-            "PEG Ratio": "ratio", # Will show N/A
-            "Trailing P/E": "ratio",
-            "Market Cap (B)": "currency_billion",
-        }
+        # --- DEBUGGING END ---
+        
+        return company_name, price, eps, growth_rate_percent
 
-        for col, fmt_type in format_map.items():
-            if col in df_formatted.columns:
-                df_formatted[col] = df_formatted[col].apply(lambda x: format_value(x, fmt_type))
+    except Exception as e:
+        print(f"ERROR: An exception occurred while fetching data for '{ticker_symbol}': {e}", file=sys.stderr)
+        print("This could indicate a network issue or a breaking change in yfinance/Yahoo Finance structure.", file=sys.stderr)
+        return None, None, None, None
 
-        st.dataframe(df_formatted.transpose(), use_container_width=True) # Transpose for metrics as rows
+def main():
+    """
+    Main function to run the PEG ratio calculator for top S&P 500 companies.
+    """
+    print("--- PEG Ratio Calculator for Top 10 S&P 500 Companies ---")
+    print("Fetching data from Yahoo Finance using 'yfinance'.")
+    print("Note: The 'Next 5 Years Earnings Growth' estimate is crucial for PEG and may not be available for all stocks.")
+    print("If data is missing, check your internet connection and the yfinance library's status.")
+    print("-" * 70)
 
-        st.markdown("---")
-        st.subheader("Understanding the Metrics:")
-        st.markdown("""
-        *   **1Yr Sales Growth:** The percentage increase in a company's revenue over the past 12 months (latest fiscal year vs. previous fiscal year). Higher is generally better for growth.
-        *   **5Yr Sales Growth:** The Compound Annual Growth Rate (CAGR) of a company's revenue over the past five fiscal years. Indicates consistent long-term growth. Requires at least 5 years of historical annual revenue data.
-        *   **Debt to Equity:** A ratio indicating the proportion of equity and debt used to finance a company's assets, calculated as (Long Term Debt + Short Term Debt) / Total Stockholder Equity. Lower is generally better (less reliance on debt), but varies significantly by industry (e.g., financial institutions often have higher D/E). An "Inf" value means total equity is zero or negative.
-        *   **PEG Ratio (Price/Earnings to Growth Ratio):** A stock's price-to-earnings (P/E) ratio divided by the growth rate of its earnings per share (EPS).
-            *   **⚠️ IMPORTANT NOTE ON PEG RATIO:** This metric **cannot be reliably calculated using `yfinance`** because it fundamentally requires *future* earnings per share (EPS) growth estimates (typically a 5-year forecasted growth from analysts), which `yfinance` does not provide. Therefore, it will always show "N/A" for live fetched companies in this application.
-        *   **Trailing P/E (Price/Earnings Ratio):** The stock's current share price divided by its earnings per share (EPS) over the past 12 months. This is included here as a readily available fundamental valuation metric.
-        """)
+    top_sp500_tickers = [
+        "MSFT",  # Microsoft
+        "NVDA",  # Nvidia
+        "AAPL",  # Apple Inc.
+        "AMZN",  # Amazon
+        "GOOGL", # Alphabet Inc. (Class A)
+        "GOOG",  # Alphabet Inc. (Class C)
+        "META",  # Meta Platforms
+        "AVGO",  # Broadcom
+        "BRK.B", # Berkshire Hathaway
+        "TSLA",  # Tesla, Inc.
+    ]
 
-        st.info("""
-        **Disclaimer:**
-        *   Data is fetched using `yfinance` and may have limitations, be delayed, or occasional inaccuracies.
-        *   **PEG Ratio** is not available via `yfinance` as it requires future earnings growth estimates.
-        *   Financial metrics should always be analyzed in context of industry, company size, and overall economic conditions.
-        *   This application is for informational purposes only and is not financial advice.
-        """)
+    results = []
 
-    else:
-        st.warning("No data could be retrieved for the entered tickers. Please ensure they are valid NYSE/NASDAQ symbols and have available financial data.")
-else:
-    st.info("Please enter one or more ticker symbols to begin the comparison.")
+    for ticker_symbol in top_sp500_tickers:
+        print(f"Processing {ticker_symbol}...", end=' ')
+        company_name, price, eps, growth_rate = get_stock_data(ticker_symbol)
+
+        if price is None or eps is None or growth_rate is None:
+            results.append({
+                "Ticker": ticker_symbol,
+                "Company Name": company_name if company_name else "N/A",
+                "Status": "Data Missing/Invalid",
+                "PEG Ratio": "N/A",
+                "P/E Ratio": "N/A",
+                "Growth Rate": "N/A"
+            })
+            print("Skipped (Data Missing)")
+            continue
+
+        peg_ratio = calculate_peg_ratio(price, eps, growth_rate)
+        pe_ratio = price / eps if eps > 0 else "N/A" # Calculate P/E even if PEG fails due to growth rate
+
+        results.append({
+            "Ticker": ticker_symbol,
+            "Company Name": company_name,
+            "Status": "Success",
+            "PEG Ratio": f"{peg_ratio:.2f}" if peg_ratio is not None else "Cannot Calculate",
+            "P/E Ratio": f"{pe_ratio:.2f}" if pe_ratio != "N/A" else "N/A",
+            "Growth Rate": f"{growth_rate:.2f}%"
+        })
+        print("Done")
+
+    print("\n" + "=" * 70)
+    print("--- Summary of PEG Ratios for Top S&P 500 Companies ---")
+    print("=" * 70)
+
+    print(f"{'Ticker':<8} | {'Company Name':<25} | {'P/E Ratio':<12} | {'Growth Rate':<15} | {'PEG Ratio':<12} | {'Status':<15}")
+    print("-" * 105)
+    for result in results:
+        print(f"{result['Ticker']:<8} | {result['Company Name']:<25} | {result['P/E Ratio']:<12} | {result['Growth Rate']:<15} | {result['PEG Ratio']:<12} | {result['Status']:<15}")
+
+    print("\nInterpretation:")
+    print("  - PEG < 1: Potentially undervalued relative to growth.")
+    print("  - PEG = 1: Fairly valued.")
+    print("  - PEG > 1: Potentially overvalued relative to growth.")
+    print("  - 'Cannot Calculate' may be due to negative EPS or negative/zero growth rate.")
+    print("\n--- End of Report ---")
+
+if __name__ == "__main__":
+    main()
